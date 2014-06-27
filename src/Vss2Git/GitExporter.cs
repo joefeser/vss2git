@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -69,6 +70,8 @@ namespace Hpdi.Vss2Git
             this.revisionAnalyzer = revisionAnalyzer;
             this.changesetBuilder = changesetBuilder;
         }
+
+        public List<string> pathsToAdd = new List<string>();
 
         public void ExportToGit(string repoPath)
         {
@@ -133,6 +136,8 @@ namespace Hpdi.Vss2Git
                 tagsUsed.Clear();
                 foreach (var changeset in changesets)
                 {
+                    pathsToAdd.Clear();
+
                     var changesetDesc = string.Format(CultureInfo.InvariantCulture,
                         "changeset {0} from {1}", changesetId, changeset.DateTime);
 
@@ -158,6 +163,7 @@ namespace Hpdi.Vss2Git
                     // commit changes
                     if (needCommit)
                     {
+                        AddNewItems(git);
                         LogStatus(work, "Committing " + changesetDesc);
                         if (CommitChangeset(git, changeset))
                         {
@@ -231,6 +237,25 @@ namespace Hpdi.Vss2Git
             });
         }
 
+        private void AddNewItems(GitWrapper git)
+        {
+            int counter = 0;
+            if (pathsToAdd.Count > 0)
+            {
+                while (true)
+                {
+                    //make sure we do not make the path so long it will not run.
+                    var itemsToAdd = pathsToAdd.Skip(counter * 100).Take(100).ToList();
+                    if (itemsToAdd.Count == 0)
+                    {
+                        return;
+                    }
+                    git.Add(itemsToAdd);
+                    counter++;
+                }
+            }
+        }
+
         private bool ReplayChangeset(VssPathMapper pathMapper, Changeset changeset,
             GitWrapper git, LinkedList<Revision> labels)
         {
@@ -244,17 +269,31 @@ namespace Hpdi.Vss2Git
 
                 AbortRetryIgnore(delegate
                 {
-                    needCommit |= ReplayRevision(pathMapper, revision, git, labels);
+                    needCommit |= ReplayRevision(pathMapper, revision, git, labels, needCommit, changeset);
                 });
             }
             return needCommit;
         }
 
         private bool ReplayRevision(VssPathMapper pathMapper, Revision revision,
-            GitWrapper git, LinkedList<Revision> labels)
+            GitWrapper git, LinkedList<Revision> labels, bool pendingCommit, Changeset changeset)
         {
             var needCommit = false;
             var actionType = revision.Action.Type;
+
+            Action inlineCommit = () =>
+            {
+                if (pendingCommit)
+                {
+                    AddNewItems(git);
+                    //LogStatus(work, "Committing During a move");
+                    if (CommitChangeset(git, changeset))
+                    {
+                        pathsToAdd.Clear();
+                    }
+                }
+            };
+
             if (revision.Item.IsProject)
             {
                 // note that project path (and therefore target path) can be
@@ -325,11 +364,11 @@ namespace Hpdi.Vss2Git
                                         if (successor != null)
                                         {
                                             // we already have another project with the same logical name
-                                            logger.WriteLine("NOTE: {0} contains another directory named {1}; not deleting directory", 
+                                            logger.WriteLine("NOTE: {0} contains another directory named {1}; not deleting directory",
                                                 projectDesc, target.LogicalName);
                                             writeProjectPhysicalName = successor; // rewrite this project because it gets deleted below
                                         }
-                                        
+
                                         if (((VssProjectInfo)itemInfo).ContainsFiles())
                                         {
                                             git.Remove(targetPath, true);
@@ -380,12 +419,18 @@ namespace Hpdi.Vss2Git
                                     var projectInfo = itemInfo as VssProjectInfo;
                                     if (projectInfo == null || projectInfo.ContainsFiles())
                                     {
+                                        foreach (var item in pathsToAdd.Where(item => item.StartsWith(sourcePath, StringComparison.OrdinalIgnoreCase)).ToList())
+                                        {
+                                            pathsToAdd.Remove(item);
+                                        }
+                                        inlineCommit();
                                         CaseSensitiveRename(sourcePath, targetPath, git.Move);
                                         needCommit = true;
                                     }
                                     else
                                     {
                                         // git doesn't care about directories with no files
+                                        inlineCommit();
                                         CaseSensitiveRename(sourcePath, targetPath, Directory.Move);
                                     }
                                 }
@@ -414,6 +459,11 @@ namespace Hpdi.Vss2Git
                                 {
                                     if (projectInfo.ContainsFiles())
                                     {
+                                        foreach (var item in pathsToAdd.Where(item => item.StartsWith(sourcePath, StringComparison.OrdinalIgnoreCase)).ToList())
+                                        {
+                                            pathsToAdd.Remove(item);
+                                        }
+                                        inlineCommit();
                                         git.Move(sourcePath, targetPath);
                                         needCommit = true;
                                     }
@@ -442,6 +492,7 @@ namespace Hpdi.Vss2Git
                                 project, target, moveToAction.NewProject);
                             if (projectInfo.Destroyed && targetPath != null && Directory.Exists(targetPath))
                             {
+                                inlineCommit();
                                 // project was moved to a now-destroyed project; remove empty directory
                                 Directory.Delete(targetPath, true);
                             }
@@ -544,7 +595,8 @@ namespace Hpdi.Vss2Git
                         if (WriteRevisionTo(target.PhysicalName, version, targetPath))
                         {
                             // add file explicitly, so it is visible to subsequent git operations
-                            git.Add(targetPath);
+                            pathsToAdd.Add(targetPath);
+                            //git.Add(targetPath);
                             needCommit = true;
                         }
                     }
@@ -662,7 +714,8 @@ namespace Hpdi.Vss2Git
                 if (WriteRevisionTo(physicalName, version, path))
                 {
                     // add file explicitly, so it is visible to subsequent git operations
-                    git.Add(path);
+                    //git.Add(path);
+                    pathsToAdd.Add(path);
                     needCommit = true;
                 }
             }
@@ -673,12 +726,23 @@ namespace Hpdi.Vss2Git
         {
             VssFile item;
             VssFileRevision revision;
-            Stream contents;
+            //Stream contents;
             try
             {
                 item = (VssFile)database.GetItemPhysical(physical);
                 revision = item.GetRevision(version);
-                contents = revision.GetContents();
+                using (var contents = revision.GetContents())
+                {
+                    //if (contents.Length == 0)
+                    //{
+                    //    return false;
+                    //}
+                    //else
+                    //{
+                    // propagate exceptions here (e.g. disk full) to abort/retry/ignore
+                    WriteStream(contents, destPath);
+                    //}
+                }
             }
             catch (Exception e)
             {
@@ -689,11 +753,7 @@ namespace Hpdi.Vss2Git
                 return false;
             }
 
-            // propagate exceptions here (e.g. disk full) to abort/retry/ignore
-            using (contents)
-            {
-                WriteStream(contents, destPath);
-            }
+
 
             // try to use the first revision (for this branch) as the create time,
             // since the item creation time doesn't seem to be meaningful
